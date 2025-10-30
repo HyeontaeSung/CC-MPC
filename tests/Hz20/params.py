@@ -136,7 +136,7 @@ SCENARIO_scene3_ov4_gap60 = pytest.param(
 CONTROLS_scene4 = [
     util.AttrDict(
         interval=(0, 12*10,),
-        control=carla.VehicleControl(throttle=0.6)
+        control=carla.VehicleControl(throttle=0.6) # throttle=0.6
     ),
 ]
 SCENARIO_scene4_ov1_brake = pytest.param(
@@ -146,7 +146,7 @@ SCENARIO_scene4_ov1_brake = pytest.param(
         ego_spawn_idx=89,
         other_spawn_ids=[201],
         other_routes=STRAIGHT_ROUTES,
-        spawn_shifts=[-17, 0],
+        spawn_shifts=[-17, 0], # it was 0
         n_burn_interval=12,
         run_interval=26,
         controls=CONTROLS_scene4,
@@ -179,7 +179,7 @@ SCENARIO_scene4_ov1_accel = pytest.param(
         ego_spawn_idx=89,
         other_spawn_ids=[201],
         other_routes=STRAIGHT_ROUTES,
-        spawn_shifts=[-17, -19],
+        spawn_shifts=[-17, -19], 
         n_burn_interval=12,
         run_interval=26,
         controls=CONTROLS_scene4,
@@ -213,16 +213,33 @@ SCENARIO_scene4_ov2_gap55 = pytest.param(
 Should succeed within 30 steps (average is about 25 steps).
 May not traverse intersection within 30 steps if EV yields to vehicles in the back.
 """
+# MONTEOCARLO_scene3_ov4_gap60 = pytest.param(
+#     ScenarioParameters(
+#         ego_spawn_idx=85,
+#         other_spawn_ids=[14, 14], #[15, 14, 15, 14],
+#         spawn_shifts=[-15, 27, 4],# [-15, 20, 20, [-42, -38], [-42, -38]],
+#         other_routes=STRAIGHT_ROUTES,
+#         n_burn_interval=12,
+#         run_interval=30,
+#         controls=CONTROLS_scene3,
+#         goal=util.AttrDict(distance=75), # 75
+#         turn_choices=[1],
+#         max_distance=120,
+#     ),
+#     id="scene3_ov4_gap60"
+# )
+
+# the star scenario at TCST
 MONTEOCARLO_scene3_ov4_gap60 = pytest.param(
     ScenarioParameters(
         ego_spawn_idx=85,
-        other_spawn_ids=[15, 14, 15, 14],
-        spawn_shifts=[-15, 20, 20, [-42, -38], [-42, -38]],
+        other_spawn_ids=[ 14, 61], #[15, 14, 15, 14],
+        spawn_shifts=[-15, 24.5, 10.5], # [-15, 20, 20, [-42, -38], [-42, -38]],
         other_routes=STRAIGHT_ROUTES,
         n_burn_interval=12,
         run_interval=30,
         controls=CONTROLS_scene3,
-        goal=util.AttrDict(distance=110),
+        goal=util.AttrDict(distance=75), # 75
         turn_choices=[1],
         max_distance=120,
     ),
@@ -237,11 +254,11 @@ MONTECARLO_scene4_ov1_accel = pytest.param(
         ego_spawn_idx=89,
         other_spawn_ids=[201],
         other_routes=STRAIGHT_ROUTES,
-        spawn_shifts=[-17, [-17, -21]],
+        spawn_shifts=[-5,28],  # the intersection starts from 39.6 [-17, [-17, -21]] [-17, -30]
         n_burn_interval=12,
         run_interval=30,
         controls=CONTROLS_scene4,
-        goal=util.AttrDict(distance=100),
+        goal=util.AttrDict(distance=100), # 100
         turn_choices=[0],
         max_distance=200
     ),
@@ -255,11 +272,11 @@ MONTECARLO_scene4_ov1_brake = pytest.param(
         ego_spawn_idx=89,
         other_spawn_ids=[201],
         other_routes=STRAIGHT_ROUTES,
-        spawn_shifts=[-17, [-4, 0]],
+        spawn_shifts=[-17, 10], # first was [-17, [-4, 0]], 
         n_burn_interval=12,
         run_interval=50,
         controls=CONTROLS_scene4,
-        goal=util.AttrDict(distance=100),
+        goal=util.AttrDict(distance=80), # it was 80
         turn_choices=[0],
         max_distance=200
     ),
@@ -273,7 +290,7 @@ MONTECARLO_scene4_ov2_gap55 = pytest.param(
         ego_spawn_idx=89,
         other_spawn_ids=[201, 201],
         other_routes=STRAIGHT_ROUTES,
-        spawn_shifts=[-17, 3, [-54, -50]],
+        spawn_shifts=[-17, 5, -27], # [-17, 3, [-54, -50]]
         n_burn_interval=12,
         run_interval=40,
         controls=CONTROLS_scene4,
@@ -357,7 +374,7 @@ VARIABLES_ph8_step1_ncoin1_r_np5000 = pytest.param(
         prediction_horizon=8,
         control_horizon=8,
         step_horizon=1,
-        n_predictions=5000,
+        n_predictions=100_000,
         n_coincide=1,
         random_mcc=True,
         loop_type=LoopEnum.CLOSED_LOOP

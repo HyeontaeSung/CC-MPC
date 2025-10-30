@@ -1,6 +1,7 @@
 import pytest
 
 from collect.in_simulation.midlevel.v8 import MidlevelAgent as MidlevelAgentV8
+from collect.in_simulation.midlevel.v8ideal import MidlevelAgent as MidlevelAgentV8ideal
 from collect.in_simulation.midlevel.v9 import MidlevelAgent as MidlevelAgentV9
 from collect.generate.scene.v3_2.trajectron_scene import (
     TrajectronPlusPlusSceneBuilder
@@ -22,6 +23,9 @@ from tests.Hz20.params import (
 
 MIDLEVEL_v8 = pytest.param(
     MidlevelAgentV8, id="v8"
+)
+MIDLEVEL_v8ideal = pytest.param(
+    MidlevelAgentV8ideal, id="v8ideal"
 )
 MIDLEVEL_v9 = pytest.param(
     MidlevelAgentV9, id="v9"
@@ -50,7 +54,7 @@ MIDLEVEL_v9 = pytest.param(
 )
 @pytest.mark.parametrize(
     "midlevel_agent",
-    [MIDLEVEL_v8, MIDLEVEL_v9]
+    [MIDLEVEL_v8, MIDLEVEL_v8ideal, MIDLEVEL_v9]
 )
 def test_Town03_scenario(midlevel_agent, scenario_params, ctrl_params,
     carla_Town03_synchronous, eval_env, eval_stg_cuda

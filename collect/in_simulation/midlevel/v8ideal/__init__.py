@@ -781,6 +781,10 @@ class MidlevelAgent(AbstractDataCollector):
     def compute_obstacle_constraints_GMM_Minkowski_idealprediction(
         self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh, ref_traj     
     ):
+
+        """
+            Robust planning using Minkowski sum
+        """
         constraints = []
         M_big = self.__params.M_big
         T = Tsh
@@ -962,6 +966,9 @@ class MidlevelAgent(AbstractDataCollector):
     def compute_obstacle_constraints_GMM(
         self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh     
     ):
+        """
+            Nominal planning in the TCST paper
+        """
         constraints = []
         M_big = self.__params.M_big
         T = Tsh
@@ -1086,13 +1093,799 @@ class MidlevelAgent(AbstractDataCollector):
         ovStateCov_tau_1 = (posecov_x_save, posecov_y_save, yawcov_save)
         return constraints, vertices, A_union, b_union, OVconstraint, direct, ovStateMean_tau_1, ovStateCov_tau_1
 
+    def compute_robust_constraints_GMM(
+        self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh     
+    ):
+        """
+            Robust planning in the TCST paper
+        """
+        constraints = []
+        M_big = self.__params.M_big
+        T = Tsh
+        L = self.__params.L
+        truck = {'d': np.array([3.7, 1.79])}
+        truck_d = truck['d']
+        CAR_R = 4.47213
+
+        if self.road_boundary_constraints:
+            # Auxiliary variable for masking and summing
+            Z = cp.Variable(Omicron.shape)
+
+            # Constraints for masking
+            mask_constraints = [
+                Z[i, j] == (Omicron[i, j] if not segments.mask[i] else 0)
+                for i in range(Omicron.shape[0])
+                for j in range(Omicron.shape[1])
+            ]
+
+            # Summing along axis=0
+            Z_sum = M_big * cp.sum(Z, axis=0)
+
+            # Variable and constraints for repeating
+            S_big_repeated = cp.Variable((L, T))
+            repeat_constraints = [S_big_repeated[i, :] == Z_sum for i in range(L)]
+
+            constraints += mask_constraints
+            constraints += repeat_constraints
+        else:
+            S_big_repeated = np.zeros(T, L, dtype=float)
+
+        # Let's save the frobenius norm of covariances and 2-norm of means
+        L = self.__params.L
+        Tpred = self.__control_horizon
+
+        # Let's check if the first prediction passes the intersection or not.
+        O = params.O
+        K = params.K
+        OV_injuction = np.empty((O,), dtype=object).tolist()
+        direct = np.empty((O,), dtype=object).tolist()
+        for ov_idx, ovehicle in enumerate(ovehicles):   
+            for latent_idx in range(ovehicle.n_states):
+                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                posemean_x = np.mean(poseData[0::Tpred,0])
+                posemean_y = np.mean(poseData[0::Tpred,1])
+                if posemean_x >= 190 or posemean_y <=-80: # in Town03_scene4
+                #if posemean_x <= -98.122 or (posemean_x <= -83.122 and posemean_y <= -21.178):# or posemean_y >= -21.178: # in Town03_scene3
+                    OV_injuction[ov_idx] = False
+                #elif (posemean_x >= -80.122 and posemean_y >= 10.178): 
+                #    OV_injuction[ov_idx] = False
+                else:
+                    OV_injuction[ov_idx] = True
+                #    direct[ov_idx] = "InJunction"
+        #if OV_injuction:
+        OVconstraint = False
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            OVconstraint = OVconstraint or OV_injuction[ov_idx]
+        logging.info(f"OV_injuction:{OV_injuction}")
+        logging.info(f"K:{params.K}")
+
+        # Save pose, angle [tau+1|tau] of OV
+        posemean_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posemean_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawmean_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawcov_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            for latent_idx in range(ovehicle.n_states):
+                # load data
+                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+
+                posemean_x_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,0])
+                posemean_y_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,1])
+                yawmean_save[ov_idx][latent_idx] = np.mean(yawData[:,0])
+                posecov_x_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,0])
+                posecov_y_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,1])
+                yawcov_save[ov_idx][latent_idx] = np.cov(yawData[:,0])
+
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            if OV_injuction[ov_idx]:
+                for latent_idx in range(ovehicle.n_states):
+                    for t in range(T):                      
+                        yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+                        poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+
+                        coeff1 = [-np.cos(yawData[:,t]), np.sin(yawData[:,t]), np.cos(yawData[:,t]) * poseData[t::Tpred,0] - np.sin(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[1]/2]
+                        coeff2 = [-np.sin(yawData[:,t]), -np.cos(yawData[:,t]), np.sin(yawData[:,t]) * poseData[t::Tpred,0] + np.cos(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[0]/2]
+                        coeff3 = [np.cos(yawData[:,t]), -np.sin(yawData[:,t]), -np.cos(yawData[:,t]) * poseData[t::Tpred,0] + np.sin(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[1]/2]
+                        coeff4 = [np.sin(yawData[:,t]), np.cos(yawData[:,t]), -np.sin(yawData[:,t]) * poseData[t::Tpred,0] - np.cos(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[0]/2]
+                        
+                        delta_ijt = Delta2[(ov_idx, latent_idx, t)]          
+                        eps_ijt = eps_ura[ov_idx, latent_idx] / Tpred
+                        Gamma_ijt = norm.ppf(1-eps_ijt) #norm.pdf(norm.ppf(1-eps_ijt))/eps_ijt #norm.ppf(1-eps_ijt)
+                    
+                        mean1 = np.mean(coeff1, axis=1)
+                        mean2 = np.mean(coeff2, axis=1)
+                        mean3 = np.mean(coeff3, axis=1)
+                        mean4 = np.mean(coeff4, axis=1)
+
+                        # save covs and means
+                        cov1 = np.sqrt(np.linalg.norm(np.cov(coeff1),'fro'))
+                        cov2 = np.sqrt(np.linalg.norm(np.cov(coeff2),'fro'))
+                        cov3 = np.sqrt(np.linalg.norm(np.cov(coeff3),'fro'))
+                        cov4 = np.sqrt(np.linalg.norm(np.cov(coeff4),'fro'))
+
+                        constraints += [
+                            mean1.T @ temp_x[t] + Gamma_ijt * cov1 * cp.norm(temp_x[t], p=2) + 0.5 * CAR_R <= M_big * (1-delta_ijt[0]) + S_big_repeated[0, t],
+                            mean2.T @ temp_x[t] + Gamma_ijt * cov2 * cp.norm(temp_x[t], p=2) + 0.5 * CAR_R <= M_big * (1-delta_ijt[1]) + S_big_repeated[1, t],
+                            mean3.T @ temp_x[t] + Gamma_ijt * cov3 * cp.norm(temp_x[t], p=2) + 0.5 * CAR_R <= M_big * (1-delta_ijt[2]) + S_big_repeated[2, t],
+                            mean4.T @ temp_x[t] + Gamma_ijt * cov4 * cp.norm(temp_x[t], p=2) + 0.5 * CAR_R <= M_big * (1-delta_ijt[3]) + S_big_repeated[3, t],
+                        ]
+                        constraints += [cp.sum(delta_ijt) == 1]
+            else:
+                constraints += []
+                 # do we need to consider not counting computation time in this case?
+
+        vertices = self.__compute_vertices(params, ovehicles)
+        A_union, b_union = self.__compute_overapproximations(
+            params, ovehicles, vertices
+        )
+
+        # predicted OV position, yaw for tau+1 at tau
+        ovStateMean_tau_1 = (posemean_x_save, posemean_y_save, yawmean_save)
+        ovStateCov_tau_1 = (posecov_x_save, posecov_y_save, yawcov_save)
+        return constraints, vertices, A_union, b_union, OVconstraint, direct, ovStateMean_tau_1, ovStateCov_tau_1
+
+    def compute_obstacle_constraints_GMM_approx(
+        self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh, ref_traj     
+    ):
+        """"
+            Choose only one constraint that is the most feasible using a reference trajectory 
+            modified from nominal planning in the TCST paper
+        """
+        constraints = []
+        M_big = self.__params.M_big
+        T = Tsh
+        L, K = self.__params.L, params.K
+        truck = {'d': np.array([3.7, 1.79])}
+        truck_d = truck['d']
+        CAR_R = 4.47213 # this is actually a diameter
+
+        if self.road_boundary_constraints:
+            # Auxiliary variable for masking and summing
+            Z = cp.Variable(Omicron.shape)
+
+            # Constraints for masking
+            mask_constraints = [
+                Z[i, j] == (Omicron[i, j] if not segments.mask[i] else 0)
+                for i in range(Omicron.shape[0])
+                for j in range(Omicron.shape[1])
+            ]
+
+            # Summing along axis=0
+            Z_sum = M_big * cp.sum(Z, axis=0)
+
+            # Variable and constraints for repeating
+            S_big_repeated = cp.Variable((L, T))
+            repeat_constraints = [S_big_repeated[i, :] == Z_sum for i in range(L)]
+
+            constraints += mask_constraints
+            constraints += repeat_constraints
+        else:
+            S_big_repeated = np.zeros((L, T), dtype=float)
+
+        Tpred = self.__prediction_horizon
+        # Let's check if the first prediction passes the intersection or not.
+        O = params.O
+        OV_injuction = np.empty((O,), dtype=object).tolist()
+        direct = np.empty((O,), dtype=object).tolist()
+        for ov_idx, ovehicle in enumerate(ovehicles):   
+            for latent_idx in range(ovehicle.n_states):
+                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                posemean_x = np.mean(poseData[0::Tpred,0])
+                posemean_y = np.mean(poseData[0::Tpred,1])
+                if posemean_x >= 190 or posemean_y <= -80: # in Town03_scene4 T inersection.
+                # if posemean_x <= -98.122 or (posemean_x <= -83.122 and posemean_y <= -21.178):# or posemean_y >= -21.178: # in Town03_scene3 Star intersection
+                #    OV_injuction[ov_idx] = False
+                # elif (posemean_x >= -80.122 and posemean_y >= 10.178): # Star intersection
+                    OV_injuction[ov_idx] = False 
+                else:
+                    OV_injuction[ov_idx] = True
+                #    direct[ov_idx] = "InJunction"
+        
+
+        #logging.info(f"OV{OV_injuction}")
+        logging.info(f"K:{params.K}")
+        #if OV_injuction:
+        OVconstraint = False
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            OVconstraint = OVconstraint or OV_injuction[ov_idx]
+
+        # Save pose, angle [tau+1|tau] of OV
+        posemean_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posemean_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawmean_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawcov_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            for latent_idx in range(ovehicle.n_states):
+                # load data
+                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+
+                posemean_x_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,0])
+                posemean_y_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,1])
+                yawmean_save[ov_idx][latent_idx] = np.mean(yawData[:,0])
+                posecov_x_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,0])
+                posecov_y_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,1])
+                yawcov_save[ov_idx][latent_idx] = np.cov(yawData[:,0])
+        
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            if OV_injuction[ov_idx]:
+                for latent_idx in range(ovehicle.n_states):
+                    for t in range(T):                      
+                        yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+                        poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+
+                        coeff1 = [-np.cos(yawData[:,t]), np.sin(yawData[:,t]), np.cos(yawData[:,t]) * poseData[t::Tpred,0] - np.sin(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[1]/2]
+                        coeff2 = [-np.sin(yawData[:,t]), -np.cos(yawData[:,t]), np.sin(yawData[:,t]) * poseData[t::Tpred,0] + np.cos(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[0]/2]
+                        coeff3 = [np.cos(yawData[:,t]), -np.sin(yawData[:,t]), -np.cos(yawData[:,t]) * poseData[t::Tpred,0] + np.sin(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[1]/2]
+                        coeff4 = [np.sin(yawData[:,t]), np.cos(yawData[:,t]), -np.sin(yawData[:,t]) * poseData[t::Tpred,0] - np.cos(yawData[:,t]) * poseData[t::Tpred,1] + truck_d[0]/2]
+
+                        delta_ijt = Delta2[(ov_idx, latent_idx, t)]          
+                        eps_ijt = eps_ura[ov_idx, latent_idx] / Tpred
+                        Gamma_ijt = norm.ppf(1-eps_ijt) # np.sqrt((1-eps_ijt)/eps_ijt) # norm.pdf(norm.ppf(1-eps_ijt))/eps_ijt #norm.ppf(1-eps_ijt)
+                    
+                        mean1 = np.mean(coeff1, axis=1)
+                        mean2 = np.mean(coeff2, axis=1)
+                        mean3 = np.mean(coeff3, axis=1)
+                        mean4 = np.mean(coeff4, axis=1)
+                        
+                        cov1 = linalg.sqrtm(np.cov(coeff1))
+                        cov2 = linalg.sqrtm(np.cov(coeff2))
+                        cov3 = linalg.sqrtm(np.cov(coeff3))
+                        cov4 = linalg.sqrtm(np.cov(coeff4))
+
+                        ref_x = [ref_traj[t][0], ref_traj[t][1], 1]
+                        
+                        val1 = mean1.T @ ref_x + Gamma_ijt * np.linalg.norm(cov1 @ ref_x) + 0.5 * CAR_R
+                        val2 = mean2.T @ ref_x + Gamma_ijt * np.linalg.norm(cov2 @ ref_x) + 0.5 * CAR_R
+                        val3 = mean3.T @ ref_x + Gamma_ijt * np.linalg.norm(cov3 @ ref_x) + 0.5 * CAR_R
+                        val4 = mean4.T @ ref_x + Gamma_ijt * np.linalg.norm(cov4 @ ref_x) + 0.5 * CAR_R
+
+                        val = [val1, val2, val3, val4]
+
+                        const_idx = val.index(min(val))
+                        if 0==const_idx:
+                            constraints += [mean1.T @ temp_x[t] + Gamma_ijt * cp.norm(cov1 @ temp_x[t], p=2) + 0.5 * CAR_R <= S_big_repeated[0, t]]
+                            # print("add")
+                        if 1==const_idx:
+                            constraints += [mean2.T @ temp_x[t] + Gamma_ijt * cp.norm(cov2 @ temp_x[t], p=2) + 0.5 * CAR_R <= S_big_repeated[1, t]]
+                            # print("add")
+                        if 2==const_idx:
+                            constraints += [mean3.T @ temp_x[t] + Gamma_ijt * cp.norm(cov3 @ temp_x[t], p=2) + 0.5 * CAR_R <= S_big_repeated[2, t]]
+                            # print("add")
+                        if 3==const_idx:
+                            constraints += [mean4.T @ temp_x[t] + Gamma_ijt * cp.norm(cov4 @ temp_x[t], p=2) + 0.5 * CAR_R <= S_big_repeated[3, t]]
+                            # print("add")
+
+            else:
+                constraints += []
+        # constraints = []
+        vertices = self.__compute_vertices(params, ovehicles)
+        A_union, b_union = self.__compute_overapproximations(
+            params, ovehicles, vertices
+        )
+
+        ovStateMean_tau_1 = (posemean_x_save, posemean_y_save, yawmean_save)
+        ovStateCov_tau_1 = (posecov_x_save, posecov_y_save, yawcov_save)
+        return constraints, vertices, A_union, b_union, OVconstraint, direct, ovStateMean_tau_1, ovStateCov_tau_1
+
+    def compute_obstacle_constraints_GMM_affine(
+        self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh, ref_traj     
+    ):
+        """"
+            Choose only one constraint that is the most feasible using a reference trajectory
+            ignore the heading uncertainty
+            Nominal planning in the IFAC paper
+        """
+        constraints = []
+        M_big = self.__params.M_big
+        T = Tsh
+        L, K = self.__params.L, params.K
+        truck = {'d': np.array([3.7, 1.79])}
+        truck_d = truck['d']
+        CAR_R = 4.47213 # this is actually a diameter
+
+        R = 3.4 # EV radius + OV radius
+
+        if self.road_boundary_constraints:
+            # Auxiliary variable for masking and summing
+            Z = cp.Variable(Omicron.shape)
+
+            # Constraints for masking
+            mask_constraints = [
+                Z[i, j] == (Omicron[i, j] if not segments.mask[i] else 0)
+                for i in range(Omicron.shape[0])
+                for j in range(Omicron.shape[1])
+            ]
+
+            # Summing along axis=0
+            Z_sum = M_big * cp.sum(Z, axis=0)
+
+            # Variable and constraints for repeating
+            S_big_repeated = cp.Variable((L, T))
+            repeat_constraints = [S_big_repeated[i, :] == Z_sum for i in range(L)]
+
+            constraints += mask_constraints
+            constraints += repeat_constraints
+        else:
+            S_big_repeated = np.zeros((L, T), dtype=float)
+
+        Tpred = self.__prediction_horizon
+        # Let's check if the first prediction passes the intersection or not.
+        O = params.O
+        OV_injuction = np.empty((O,), dtype=object).tolist()
+        direct = np.empty((O,), dtype=object).tolist()
+        out_junction = False # if you want to decide if ovs are in juction
+        if out_junction:
+            for ov_idx, ovehicle in enumerate(ovehicles):   
+                for latent_idx in range(ovehicle.n_states):
+                    poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                    posemean_x = np.mean(poseData[0::Tpred,0])
+                    posemean_y = np.mean(poseData[0::Tpred,1])
+                    if posemean_x >= 190 or posemean_y <= -80: # in Town03_scene4 T inersection.
+                    # if posemean_x <= -98.122 or (posemean_x <= -83.122 and posemean_y <= -21.178):# or posemean_y >= -21.178: # in Town03_scene3 Star intersection
+                    #    OV_injuction[ov_idx] = False
+                    # elif (posemean_x >= -80.122 and posemean_y >= 10.178): # Star intersection
+                        OV_injuction[ov_idx] = False 
+                    else:
+                        OV_injuction[ov_idx] = True
+                    #    direct[ov_idx] = "InJunction"
+        
+
+        #logging.info(f"OV{OV_injuction}")
+        logging.info(f"K:{params.K}")
+        #if OV_injuction:
+        OVconstraint = False
+        if out_junction:
+            for ov_idx, ovehicle in enumerate(ovehicles):
+                OVconstraint = OVconstraint or OV_injuction[ov_idx]
+
+        # Save pose, angle [tau+1|tau] of OV
+        posemean_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posemean_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawmean_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawcov_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            for latent_idx in range(ovehicle.n_states):
+                # load data
+                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+
+                posemean_x_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,0])
+                posemean_y_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,1])
+                yawmean_save[ov_idx][latent_idx] = np.mean(yawData[:,0])
+                posecov_x_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,0])
+                posecov_y_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,1])
+                yawcov_save[ov_idx][latent_idx] = np.cov(yawData[:,0])
+        
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            if True: # OV_injuction[ov_idx]:
+                for latent_idx in range(ovehicle.n_states):
+                    poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                    # logging.info(f"Tpred:{Tpred}")
+                    # logging.info(f"shape:{np.shape(poseData[0::Tpred,0])}")
+                    for t in range(T):                      
+                        # yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+                        # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+
+                        # delta_ijt = Delta2[(ov_idx, latent_idx, t)]          
+                        eps_ijt = eps_ura[ov_idx, latent_idx] / Tpred
+                        Gamma_ijt = norm.ppf(1-eps_ijt) #np.sqrt((1-eps_ijt)/eps_ijt) #norm.pdf(norm.ppf(1-eps_ijt))/eps_ijt #norm.ppf(1-eps_ijt)
+
+                        
+                        p0 = poseData[t::Tpred,0]
+                        p1 = poseData[t::Tpred,1]
+
+                        mean_p0 = np.mean(p0)
+                        mean_p1 = np.mean(p1)
+                        
+                        mean = np.array([mean_p0, mean_p1])
+                        # logging.info(f"t:{t}, mean:{mean}")
+                        cov = np.cov([p0, p1])
+                        cov_sqrt = linalg.sqrtm(cov)
+                        # logging.info(f"t:{t}, mean: {mean}, cov: {cov}")
+                        m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
+                        M = np.array([m, -1])
+
+                        Sigma = np.identity(n=2)
+                        ref_pose = np.array((ref_traj[t][0], ref_traj[t][1])) 
+
+                        n_star, d_star, which_idx = makeconstraint.choose_closest_tangent(mean, Sigma, R, m, ref_pose)
+                        
+                        if n_star @ mean <= d_star:
+                            constraints += [
+                                n_star.T @ cp.vstack([temp_x[t][0], temp_x[t][1]]) >= d_star + Gamma_ijt * cp.norm(cov_sqrt @ M.T, p=2) \
+                                + S_big_repeated[0, t]
+                                # + R*np.sqrt(m*m+1)
+                            ]
+                        else:
+                            constraints += [
+                                n_star.T @ cp.vstack([temp_x[t][0], temp_x[t][1]]) <= d_star - Gamma_ijt * cp.norm(cov_sqrt @ M.T, p=2) \
+                                + S_big_repeated[0, t]
+                                # - R*np.sqrt(m*m+1)
+                            ]
+
+
+                        # val1 = m*(ref_traj[t][0] - mean_p0) - (ref_traj[t][1] - mean_p1)
+                        # val2 = - m*(ref_traj[t][0] - mean_p0) + (ref_traj[t][1] - mean_p1)
+
+                        # val = [val1, val2]
+                        # const_idx = val.index(min(val))
+                        # if 0==const_idx:
+                        #     constraints += [m*(temp_x[t][0] - mean_p0) - (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cp.norm(cov_sqrt @ M.T, p=2) <= S_big_repeated[0, t]]
+                        # elif 1==const_idx:
+                        #     constraints += [-m*(temp_x[t][0] - mean_p0) + (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cp.norm(cov_sqrt @ M.T, p=2) <= S_big_repeated[0, t]]
+
+
+            else:
+                constraints += []
+        # constraints = []
+        vertices = self.__compute_vertices(params, ovehicles)
+        A_union, b_union = self.__compute_overapproximations(
+            params, ovehicles, vertices
+        )
+
+        ovStateMean_tau_1 = (posemean_x_save, posemean_y_save, yawmean_save)
+        ovStateCov_tau_1 = (posecov_x_save, posecov_y_save, yawcov_save)
+        return constraints, vertices, A_union, b_union, OVconstraint, direct, ovStateMean_tau_1, ovStateCov_tau_1, 0
+
+    def compute_obstacle_constraints_GMM_affine_robust(
+        self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh, ref_traj     
+    ):
+        """"
+            Choose only one constraint that is the most feasible using a reference trajectory
+            ignore the heading uncertainty
+            Fix the heading angle in shrinking-horizon
+            Robust planning assuming shriking of predictions
+        """
+        constraints = []
+        M_big = self.__params.M_big
+        T = Tsh
+        L, K = self.__params.L, params.K
+        truck = {'d': np.array([3.7, 1.79])}
+        truck_d = truck['d']
+        CAR_R = 4.47213 # this is actually a diameter
+
+        R = 3.4 # EV radius + OV radius
+
+        if self.road_boundary_constraints:
+            # Auxiliary variable for masking and summing
+            Z = cp.Variable(Omicron.shape)
+
+            # Constraints for masking
+            mask_constraints = [
+                Z[i, j] == (Omicron[i, j] if not segments.mask[i] else 0)
+                for i in range(Omicron.shape[0])
+                for j in range(Omicron.shape[1])
+            ]
+
+            # Summing along axis=0
+            Z_sum = M_big * cp.sum(Z, axis=0)
+
+            # Variable and constraints for repeating
+            S_big_repeated = cp.Variable((L, T))
+            repeat_constraints = [S_big_repeated[i, :] == Z_sum for i in range(L)]
+
+            constraints += mask_constraints
+            constraints += repeat_constraints
+        else:
+            S_big_repeated = np.zeros((L, T), dtype=float)
+
+        Tpred = self.__prediction_horizon
+        # ideal prediction
+        if T < Tpred:
+            ideal_trajs = self.predict_ideal(ovehicles, T, self.__ego_vehicle.id, params)
+
+        # logging.info(f"Tpred:{Tpred}")
+        # Let's check if the first prediction passes the intersection or not.
+        O = params.O
+        OV_injuction = np.empty((O,), dtype=object).tolist()
+        direct = np.empty((O,), dtype=object).tolist()
+        for ov_idx, ovehicle in enumerate(ovehicles):   
+            for latent_idx in range(ovehicle.n_states):
+                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                posemean_x = np.mean(poseData[0::Tpred,0])
+                posemean_y = np.mean(poseData[0::Tpred,1])
+                if posemean_x >= 190 or posemean_y <= -80: # in Town03_scene4 T inersection.
+                # if posemean_x <= -98.122 or (posemean_x <= -83.122 and posemean_y <= -21.178):# or posemean_y >= -21.178: # in Town03_scene3 Star intersection
+                #    OV_injuction[ov_idx] = False
+                # elif (posemean_x >= -80.122 and posemean_y >= 10.178): # Star intersection
+                    OV_injuction[ov_idx] = False 
+                else:
+                    OV_injuction[ov_idx] = True
+                #    direct[ov_idx] = "InJunction"
+        
+
+        #logging.info(f"OV{OV_injuction}")
+        logging.info(f"K:{params.K}")
+        #if OV_injuction:
+        OVconstraint = False
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            OVconstraint = OVconstraint or OV_injuction[ov_idx]
+
+        # Save pose, angle [tau+1|tau] of OV
+        posemean_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posemean_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawmean_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        posecov_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+        yawcov_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+
+        # save mean_pos of OV and m(tangent)
+        mean_p0p1 = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+        tangent = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+        cov_p0p1 = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+        const_idx_save = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+
+        pose_data = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+
+        halfspace = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            for latent_idx in range(ovehicle.n_states):
+                # load data
+                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+
+                posemean_x_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,0])
+                posemean_y_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,1])
+                yawmean_save[ov_idx][latent_idx] = np.mean(yawData[:,0])
+                posecov_x_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,0])
+                posecov_y_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,1])
+                yawcov_save[ov_idx][latent_idx] = np.cov(yawData[:,0])
+
+        # loaded Data 
+        if T < self.__prediction_horizon:
+            (mean_p0p1_loaded, tangent_loaded, _, _, const_idx_loaded) = self.load_data(params, self.__ego_vehicle.id)
+            num_ov = np.shape(mean_p0p1_loaded)[0]
+            num_mode = np.shape(mean_p0p1_loaded)[1]
+            mean_differ = np.empty((num_mode,), dtype=object).tolist()
+            tangent_saved = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+            const_idx_saved = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
+            index_list = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
+            for ov_idx, ovehicle in enumerate(ovehicles):
+                try:
+                    if (mean_p0p1_loaded[ov_idx][0][0] != None).any:
+                        for latent_idx in range(ovehicle.n_states):
+                            
+                            # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                            poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
+                            Tpred = T
+                            for mode_idx in range(num_mode):
+                                # logging.info(f"norm:{mean_p0p1_loaded[ov_idx][mode_idx][0]}")
+                                mean_differ[mode_idx] = np.linalg.norm((params.x_init[:2]-mean_p0p1_loaded[ov_idx][mode_idx][0]))
+                                for t in range(T):
+                                    p0 = poseData[t::Tpred,0]
+                                    p1 = poseData[t::Tpred,1]
+                                    mean_p0 = np.mean(p0)
+                                    mean_p1 = np.mean(p1)
+                                    mean = np.array([mean_p0, mean_p1])
+
+                                    mean_differ[mode_idx] += np.linalg.norm((mean-mean_p0p1_loaded[ov_idx][mode_idx][t+1]))
+                
+                            for rest in range(ovehicle.n_states, num_mode):
+                                mean_differ[rest] = M_big
+                            index_list[ov_idx][latent_idx] = np.argmin(mean_differ) # pick the minmun index
+                            tangent_saved[ov_idx][latent_idx] = tangent_loaded[ov_idx][index_list[ov_idx][latent_idx]]
+                            const_idx_saved[ov_idx][latent_idx] = const_idx_loaded[ov_idx][index_list[ov_idx][latent_idx]]
+                except: # AttributeError: 'bool' object has no attribute 'any'
+                    # logging.info(mean_p0p1_loaded[ov_idx][0][0] != None)
+                    try:
+                        if mean_p0p1_loaded[ov_idx][0][0] != None:
+
+                            for latent_idx in range(ovehicle.n_states):
+                                
+                                # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                                poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
+                                Tpred = T
+                                for mode_idx in range(num_mode):
+                                    # logging.info(f"norm:{mean_p0p1_loaded[ov_idx][mode_idx][0]}")
+                                    try:
+                                        mean_differ[mode_idx] = np.linalg.norm((params.x_init[:2]-mean_p0p1_loaded[ov_idx][mode_idx][0]))
+                                    except: # None
+                                        mean_differ[mode_idx] = M_big
+                                    for t in range(T):
+                                        p0 = poseData[t::Tpred,0]
+                                        p1 = poseData[t::Tpred,1]
+                                        mean_p0 = np.mean(p0)
+                                        mean_p1 = np.mean(p1)
+                                        mean = np.array([mean_p0, mean_p1])
+
+                                        mean_differ[mode_idx] += np.linalg.norm((mean-mean_p0p1_loaded[ov_idx][mode_idx][t+1]))
+                    
+                                for rest in range(ovehicle.n_states, num_mode):
+                                    mean_differ[rest] = M_big
+                                index_list[ov_idx][latent_idx] = np.argmin(mean_differ) # pick the minmun index
+                                tangent_saved[ov_idx][latent_idx] = tangent_loaded[ov_idx][index_list[ov_idx][latent_idx]]
+                                const_idx_saved[ov_idx][latent_idx] = const_idx_loaded[ov_idx][index_list[ov_idx][latent_idx]]
+                    except:
+                        if mean_p0p1_loaded[ov_idx][0][0][0] != None:
+
+                            for latent_idx in range(ovehicle.n_states):
+                                
+                                # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                                poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
+                                Tpred = T
+                                for mode_idx in range(num_mode):
+                                    # logging.info(f"norm:{mean_p0p1_loaded[ov_idx][mode_idx][0]}")
+                                    try:
+                                        mean_differ[mode_idx] = np.linalg.norm((params.x_init[:2]-mean_p0p1_loaded[ov_idx][mode_idx][0]))
+                                        for t in range(T):
+                                            p0 = poseData[t::Tpred,0]
+                                            p1 = poseData[t::Tpred,1]
+                                            mean_p0 = np.mean(p0)
+                                            mean_p1 = np.mean(p1)
+                                            mean = np.array([mean_p0, mean_p1])
+
+                                            mean_differ[mode_idx] += np.linalg.norm((mean-mean_p0p1_loaded[ov_idx][mode_idx][t+1]))
+ 
+                                    except: # None
+                                        mean_differ[mode_idx] = M_big
+
+                   
+                                for rest in range(ovehicle.n_states, num_mode):
+                                    mean_differ[rest] = M_big
+                                index_list[ov_idx][latent_idx] = np.argmin(mean_differ) # pick the minmun index
+                                tangent_saved[ov_idx][latent_idx] = tangent_loaded[ov_idx][index_list[ov_idx][latent_idx]]
+                                const_idx_saved[ov_idx][latent_idx] = const_idx_loaded[ov_idx][index_list[ov_idx][latent_idx]]
+        
+        ovehicles_toSave_moments = []          
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            ovehicles_toSave_moments.append(copy.deepcopy(ovehicle))    
+
+        
+        for ov_idx, ovehicle in enumerate(ovehicles):
+            if True: #OV_injuction[ov_idx]:
+                for latent_idx in range(ovehicle.n_states):
+                    # pose_data[ov_idx][latent_idx] = np.vstack(ovehicle.pred_positions[latent_idx])
+                    if T < self.__prediction_horizon:
+                        poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
+                        ovehicles_toSave_moments[ov_idx].pred_positions[latent_idx] = ideal_trajs[ov_idx][latent_idx]
+                        Tpred = T
+                        # ovehicle.pred_positions[latent_idx] = ovehicles_toSave_moments[ov_idx].pred_positions[latent_idx]
+                    else:
+                        poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                    
+                    for t in range(T):   
+                        const_idx = -1 # This is for checking if we loaded const_idx                   
+                        # yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
+                        # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
+                        # pose_data[ov_idx][latent_idx][t] = poseData
+
+                        # delta_ijt = Delta2[(ov_idx, latent_idx, t)]          
+                        eps_ijt = eps_ura[ov_idx, latent_idx] / self.__prediction_horizon
+                        Gamma_ijt = norm.ppf(1-eps_ijt) #np.sqrt((1-eps_ijt)/eps_ijt) #norm.pdf(norm.ppf(1-eps_ijt))/eps_ijt #norm.ppf(1-eps_ijt)
+                    
+                        
+                        p0 = poseData[t::Tpred,0]
+                        p1 = poseData[t::Tpred,1]
+                        
+
+                        mean_p0 = np.mean(p0)
+                        mean_p1 = np.mean(p1)
+                        
+                        mean = np.array([mean_p0, mean_p1])
+
+                        cov = np.cov([p0, p1])
+                        cov_fro = np.linalg.norm(cov, 'fro')
+                        cov_fro_sqrt = np.sqrt(cov_fro)
+
+                        if T == self.__prediction_horizon:
+                            m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
+                            const_idx = None
+                        else:
+                            try:
+                                if (mean_p0p1_loaded[ov_idx][0][0] != None).any():
+                                    m = tangent_saved[ov_idx][latent_idx][t+1]
+                                    const_idx = const_idx_saved[ov_idx][latent_idx][t+1]
+                                    # logging.info(f"m:{m}")
+                                else:
+                                    m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
+                            except:
+                                try: 
+                                    if mean_p0p1_loaded[ov_idx][0][0] != None:
+                                        m = tangent_saved[ov_idx][latent_idx][t+1]
+                                        const_idx = const_idx_saved[ov_idx][latent_idx][t+1]
+                                        # logging.info(f"m:{m}")
+                                    else:
+                                        m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
+                                except:
+                                    if mean_p0p1_loaded[ov_idx][0][0][0] != None:
+                                        m = tangent_saved[ov_idx][latent_idx][t+1]
+                                        const_idx = const_idx_saved[ov_idx][latent_idx][t+1]
+                                        # logging.info(f"m:{m}")
+                                    else:
+                                        m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
+
+                        M = np.array([m, -1])
+
+                        # val1 = m*(ref_traj[t][0] - mean_p0) - (ref_traj[t][1] - mean_p1)
+                        # val2 = - m*(ref_traj[t][0] - mean_p0) + (ref_traj[t][1] - mean_p1)
+
+                        # val = [val1, val2]
+                        # if const_idx == -1:
+                        #     const_idx = val.index(min(val))
+
+                        # if 0==const_idx:
+                        #     constraints += [m*(temp_x[t][0] - mean_p0) - (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) <= S_big_repeated[0, t]]
+                        # elif 1==const_idx:
+                        #     constraints += [-m*(temp_x[t][0] - mean_p0) + (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) <= S_big_repeated[0, t]]
+
+
+                        Sigma = np.identity(n=2)
+                        ref_pose = np.array((ref_traj[t][0], ref_traj[t][1])) 
+
+                        n_star, d_star, const_idx = makeconstraint.choose_closest_tangent(mean, Sigma, R, m, ref_pose, const_idx)
+                        # logging.info(f"m:{m}")
+                        if n_star @ mean <= d_star:
+                            constraints += [
+                                n_star.T @ cp.vstack([temp_x[t][0], temp_x[t][1]]) >= d_star + Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) \
+                                # + R*np.sqrt(m*m+1)
+                            ]
+                            value = n_star[0] * ref_pose[0] + n_star[1] * ref_pose[1] - d_star - Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)
+                            # logging.info(f"{value}>=0")
+                            # logging.info(f"-Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2):{-Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)}")
+                            # logging.info(f"cov_fro:{cov_fro_sqrt}")
+                            A = -n_star
+                            b = - ( d_star + Gamma_ijt * cov_fro_sqrt *  np.linalg.norm(M.T, 2))
+                        else:
+                            constraints += [
+                                n_star.T @ cp.vstack([temp_x[t][0], temp_x[t][1]]) <= d_star - Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) \
+                                # - R*np.sqrt(m*m+1)
+                            ]
+                            value = n_star[0] * ref_pose[0] + n_star[1] * ref_pose[1] - d_star + Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)
+                            # logging.info(f"{value}<=0")                           
+                            # logging.info(f"Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2):{Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)}")
+                            # logging.info(f"cov_fro:{cov_fro_sqrt}")
+                            A =  n_star
+                            b = ( d_star - Gamma_ijt * cov_fro_sqrt *  np.linalg.norm(M.T, 2) )
+                        
+                        # save halfspace
+                        halfspace[ov_idx][latent_idx][t] = [A[0], A[1], b]
+
+                        # save mean and tangent
+                        mean_p0p1[ov_idx][latent_idx][t] = mean
+                        tangent[ov_idx][latent_idx][t] = m
+                        cov_p0p1[ov_idx][latent_idx][t] = cov
+                        const_idx_save[ov_idx][latent_idx][t] = const_idx
+                        # constraints += [m*(temp_x[t][0] - mean_p0) - (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) <= S_big_repeated[0, t]]
+
+            else:
+                constraints += []
+        # constraints = []
+        self.__halfspace = halfspace
+        
+        vertices = self.__compute_vertices(params, ovehicles)
+        A_union, b_union = self.__compute_overapproximations(
+            params, ovehicles, vertices
+        )
+
+        # save moments
+        self.save_moments(ovehicles_toSave_moments, params.O, K, T, self.__prediction_horizon, self.__ego_vehicle.id, params)
+
+        ovStateMean_tau_1 = (posemean_x_save, posemean_y_save, yawmean_save)
+        ovStateCov_tau_1 = (posecov_x_save, posecov_y_save, yawcov_save)
+        meanNtangent = (mean_p0p1, tangent, cov_p0p1, 0, const_idx_save)
+        return constraints, vertices, A_union, b_union, OVconstraint, direct, ovStateMean_tau_1, ovStateCov_tau_1, meanNtangent
 
     def compute_obstacle_constraints_GMM_affine_ideal(
         self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh, ref_traj     
     ):
         """"
             Choose only one constraint that is the most feasible using a reference trajectory
-            ignore the heading uncertainty
+            Ignore the heading uncertainty
+            Fix the heading angle in shrinking-horizon
+            Use ideal predictions
+            Nominal planning in the IFAC paper using ideal predictions
         """
         constraints = []
         M_big = self.__params.M_big
@@ -1662,343 +2455,7 @@ class MidlevelAgent(AbstractDataCollector):
         meanNtangent = (mean_p0p1, tangent, cov_p0p1, 0, const_idx_save)
         return constraints, vertices, A_union, b_union, OVconstraint, direct, ovStateMean_tau_1, ovStateCov_tau_1, meanNtangent
 
-    def compute_obstacle_constraints_GMM_affine_robust(
-        self, params, ovehicles, Delta2, Omicron, temp_x, eps_ura, segments, Tsh, ref_traj     
-    ):
-        """"
-            Choose only one constraint that is the most feasible using a reference trajectory
-            ignore the heading uncertainty
-            Fix the heading angle in shrinking-horizon
-        """
-        constraints = []
-        M_big = self.__params.M_big
-        T = Tsh
-        L, K = self.__params.L, params.K
-        truck = {'d': np.array([3.7, 1.79])}
-        truck_d = truck['d']
-        CAR_R = 4.47213 # this is actually a diameter
 
-        R = 3.4 # EV radius + OV radius
-
-        if self.road_boundary_constraints:
-            # Auxiliary variable for masking and summing
-            Z = cp.Variable(Omicron.shape)
-
-            # Constraints for masking
-            mask_constraints = [
-                Z[i, j] == (Omicron[i, j] if not segments.mask[i] else 0)
-                for i in range(Omicron.shape[0])
-                for j in range(Omicron.shape[1])
-            ]
-
-            # Summing along axis=0
-            Z_sum = M_big * cp.sum(Z, axis=0)
-
-            # Variable and constraints for repeating
-            S_big_repeated = cp.Variable((L, T))
-            repeat_constraints = [S_big_repeated[i, :] == Z_sum for i in range(L)]
-
-            constraints += mask_constraints
-            constraints += repeat_constraints
-        else:
-            S_big_repeated = np.zeros((L, T), dtype=float)
-
-        Tpred = self.__prediction_horizon
-        # ideal prediction
-        if T < Tpred:
-            ideal_trajs = self.predict_ideal(ovehicles, T, self.__ego_vehicle.id, params)
-
-        # logging.info(f"Tpred:{Tpred}")
-        # Let's check if the first prediction passes the intersection or not.
-        O = params.O
-        OV_injuction = np.empty((O,), dtype=object).tolist()
-        direct = np.empty((O,), dtype=object).tolist()
-        for ov_idx, ovehicle in enumerate(ovehicles):   
-            for latent_idx in range(ovehicle.n_states):
-                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
-                posemean_x = np.mean(poseData[0::Tpred,0])
-                posemean_y = np.mean(poseData[0::Tpred,1])
-                if posemean_x >= 190 or posemean_y <= -80: # in Town03_scene4 T inersection.
-                # if posemean_x <= -98.122 or (posemean_x <= -83.122 and posemean_y <= -21.178):# or posemean_y >= -21.178: # in Town03_scene3 Star intersection
-                #    OV_injuction[ov_idx] = False
-                # elif (posemean_x >= -80.122 and posemean_y >= 10.178): # Star intersection
-                    OV_injuction[ov_idx] = False 
-                else:
-                    OV_injuction[ov_idx] = True
-                #    direct[ov_idx] = "InJunction"
-        
-
-        #logging.info(f"OV{OV_injuction}")
-        logging.info(f"K:{params.K}")
-        #if OV_injuction:
-        OVconstraint = False
-        for ov_idx, ovehicle in enumerate(ovehicles):
-            OVconstraint = OVconstraint or OV_injuction[ov_idx]
-
-        # Save pose, angle [tau+1|tau] of OV
-        posemean_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
-        posemean_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
-        yawmean_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
-        posecov_x_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
-        posecov_y_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
-        yawcov_save = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
-
-        # save mean_pos of OV and m(tangent)
-        mean_p0p1 = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-        tangent = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-        cov_p0p1 = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-        const_idx_save = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-
-        pose_data = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-
-        halfspace = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-
-        for ov_idx, ovehicle in enumerate(ovehicles):
-            for latent_idx in range(ovehicle.n_states):
-                # load data
-                poseData = np.vstack(ovehicle.pred_positions[latent_idx])
-                yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
-
-                posemean_x_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,0])
-                posemean_y_save[ov_idx][latent_idx] = np.mean(poseData[0::Tpred,1])
-                yawmean_save[ov_idx][latent_idx] = np.mean(yawData[:,0])
-                posecov_x_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,0])
-                posecov_y_save[ov_idx][latent_idx] = np.cov(poseData[0::Tpred,1])
-                yawcov_save[ov_idx][latent_idx] = np.cov(yawData[:,0])
-
-        # loaded Data 
-        if T < self.__prediction_horizon:
-            (mean_p0p1_loaded, tangent_loaded, _, _, const_idx_loaded) = self.load_data(params, self.__ego_vehicle.id)
-            num_ov = np.shape(mean_p0p1_loaded)[0]
-            num_mode = np.shape(mean_p0p1_loaded)[1]
-            mean_differ = np.empty((num_mode,), dtype=object).tolist()
-            tangent_saved = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-            const_idx_saved = np.empty((np.max(O), np.max(K), T), dtype=object).tolist()
-            index_list = np.empty((np.max(O), np.max(K)), dtype=object).tolist()
-            for ov_idx, ovehicle in enumerate(ovehicles):
-                try:
-                    if (mean_p0p1_loaded[ov_idx][0][0] != None).any:
-                        for latent_idx in range(ovehicle.n_states):
-                            
-                            # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
-                            poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
-                            Tpred = T
-                            for mode_idx in range(num_mode):
-                                # logging.info(f"norm:{mean_p0p1_loaded[ov_idx][mode_idx][0]}")
-                                mean_differ[mode_idx] = np.linalg.norm((params.x_init[:2]-mean_p0p1_loaded[ov_idx][mode_idx][0]))
-                                for t in range(T):
-                                    p0 = poseData[t::Tpred,0]
-                                    p1 = poseData[t::Tpred,1]
-                                    mean_p0 = np.mean(p0)
-                                    mean_p1 = np.mean(p1)
-                                    mean = np.array([mean_p0, mean_p1])
-
-                                    mean_differ[mode_idx] += np.linalg.norm((mean-mean_p0p1_loaded[ov_idx][mode_idx][t+1]))
-                
-                            for rest in range(ovehicle.n_states, num_mode):
-                                mean_differ[rest] = M_big
-                            index_list[ov_idx][latent_idx] = np.argmin(mean_differ) # pick the minmun index
-                            tangent_saved[ov_idx][latent_idx] = tangent_loaded[ov_idx][index_list[ov_idx][latent_idx]]
-                            const_idx_saved[ov_idx][latent_idx] = const_idx_loaded[ov_idx][index_list[ov_idx][latent_idx]]
-                except: # AttributeError: 'bool' object has no attribute 'any'
-                    # logging.info(mean_p0p1_loaded[ov_idx][0][0] != None)
-                    try:
-                        if mean_p0p1_loaded[ov_idx][0][0] != None:
-
-                            for latent_idx in range(ovehicle.n_states):
-                                
-                                # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
-                                poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
-                                Tpred = T
-                                for mode_idx in range(num_mode):
-                                    # logging.info(f"norm:{mean_p0p1_loaded[ov_idx][mode_idx][0]}")
-                                    try:
-                                        mean_differ[mode_idx] = np.linalg.norm((params.x_init[:2]-mean_p0p1_loaded[ov_idx][mode_idx][0]))
-                                    except: # None
-                                        mean_differ[mode_idx] = M_big
-                                    for t in range(T):
-                                        p0 = poseData[t::Tpred,0]
-                                        p1 = poseData[t::Tpred,1]
-                                        mean_p0 = np.mean(p0)
-                                        mean_p1 = np.mean(p1)
-                                        mean = np.array([mean_p0, mean_p1])
-
-                                        mean_differ[mode_idx] += np.linalg.norm((mean-mean_p0p1_loaded[ov_idx][mode_idx][t+1]))
-                    
-                                for rest in range(ovehicle.n_states, num_mode):
-                                    mean_differ[rest] = M_big
-                                index_list[ov_idx][latent_idx] = np.argmin(mean_differ) # pick the minmun index
-                                tangent_saved[ov_idx][latent_idx] = tangent_loaded[ov_idx][index_list[ov_idx][latent_idx]]
-                                const_idx_saved[ov_idx][latent_idx] = const_idx_loaded[ov_idx][index_list[ov_idx][latent_idx]]
-                    except:
-                        if mean_p0p1_loaded[ov_idx][0][0][0] != None:
-
-                            for latent_idx in range(ovehicle.n_states):
-                                
-                                # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
-                                poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
-                                Tpred = T
-                                for mode_idx in range(num_mode):
-                                    # logging.info(f"norm:{mean_p0p1_loaded[ov_idx][mode_idx][0]}")
-                                    try:
-                                        mean_differ[mode_idx] = np.linalg.norm((params.x_init[:2]-mean_p0p1_loaded[ov_idx][mode_idx][0]))
-                                        for t in range(T):
-                                            p0 = poseData[t::Tpred,0]
-                                            p1 = poseData[t::Tpred,1]
-                                            mean_p0 = np.mean(p0)
-                                            mean_p1 = np.mean(p1)
-                                            mean = np.array([mean_p0, mean_p1])
-
-                                            mean_differ[mode_idx] += np.linalg.norm((mean-mean_p0p1_loaded[ov_idx][mode_idx][t+1]))
- 
-                                    except: # None
-                                        mean_differ[mode_idx] = M_big
-
-                   
-                                for rest in range(ovehicle.n_states, num_mode):
-                                    mean_differ[rest] = M_big
-                                index_list[ov_idx][latent_idx] = np.argmin(mean_differ) # pick the minmun index
-                                tangent_saved[ov_idx][latent_idx] = tangent_loaded[ov_idx][index_list[ov_idx][latent_idx]]
-                                const_idx_saved[ov_idx][latent_idx] = const_idx_loaded[ov_idx][index_list[ov_idx][latent_idx]]
-        
-        ovehicles_toSave_moments = []          
-        for ov_idx, ovehicle in enumerate(ovehicles):
-            ovehicles_toSave_moments.append(copy.deepcopy(ovehicle))    
-
-        
-        for ov_idx, ovehicle in enumerate(ovehicles):
-            if True: #OV_injuction[ov_idx]:
-                for latent_idx in range(ovehicle.n_states):
-                    # pose_data[ov_idx][latent_idx] = np.vstack(ovehicle.pred_positions[latent_idx])
-                    if T < self.__prediction_horizon:
-                        poseData = np.vstack(ideal_trajs[ov_idx][latent_idx])
-                        ovehicles_toSave_moments[ov_idx].pred_positions[latent_idx] = ideal_trajs[ov_idx][latent_idx]
-                        Tpred = T
-                        # ovehicle.pred_positions[latent_idx] = ovehicles_toSave_moments[ov_idx].pred_positions[latent_idx]
-                    else:
-                        poseData = np.vstack(ovehicle.pred_positions[latent_idx])
-                    
-                    for t in range(T):   
-                        const_idx = -1 # This is for checking if we loaded const_idx                   
-                        # yawData = np.vstack(ovehicle.pred_yaws[latent_idx])
-                        # poseData = np.vstack(ovehicle.pred_positions[latent_idx])
-                        # pose_data[ov_idx][latent_idx][t] = poseData
-
-                        # delta_ijt = Delta2[(ov_idx, latent_idx, t)]          
-                        eps_ijt = eps_ura[ov_idx, latent_idx] / self.__prediction_horizon
-                        Gamma_ijt = norm.ppf(1-eps_ijt) #np.sqrt((1-eps_ijt)/eps_ijt) #norm.pdf(norm.ppf(1-eps_ijt))/eps_ijt #norm.ppf(1-eps_ijt)
-                    
-                        
-                        p0 = poseData[t::Tpred,0]
-                        p1 = poseData[t::Tpred,1]
-                        
-
-                        mean_p0 = np.mean(p0)
-                        mean_p1 = np.mean(p1)
-                        
-                        mean = np.array([mean_p0, mean_p1])
-
-                        cov = np.cov([p0, p1])
-                        cov_fro = np.linalg.norm(cov, 'fro')
-                        cov_fro_sqrt = np.sqrt(cov_fro)
-
-                        if T == self.__prediction_horizon:
-                            m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
-                            const_idx = None
-                        else:
-                            try:
-                                if (mean_p0p1_loaded[ov_idx][0][0] != None).any():
-                                    m = tangent_saved[ov_idx][latent_idx][t+1]
-                                    const_idx = const_idx_saved[ov_idx][latent_idx][t+1]
-                                    # logging.info(f"m:{m}")
-                                else:
-                                    m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
-                            except:
-                                try: 
-                                    if mean_p0p1_loaded[ov_idx][0][0] != None:
-                                        m = tangent_saved[ov_idx][latent_idx][t+1]
-                                        const_idx = const_idx_saved[ov_idx][latent_idx][t+1]
-                                        # logging.info(f"m:{m}")
-                                    else:
-                                        m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
-                                except:
-                                    if mean_p0p1_loaded[ov_idx][0][0][0] != None:
-                                        m = tangent_saved[ov_idx][latent_idx][t+1]
-                                        const_idx = const_idx_saved[ov_idx][latent_idx][t+1]
-                                        # logging.info(f"m:{m}")
-                                    else:
-                                        m = - (ref_traj[t][0] - mean_p0) / (ref_traj[t][1] - mean_p1)
-
-                        M = np.array([m, -1])
-
-                        # val1 = m*(ref_traj[t][0] - mean_p0) - (ref_traj[t][1] - mean_p1)
-                        # val2 = - m*(ref_traj[t][0] - mean_p0) + (ref_traj[t][1] - mean_p1)
-
-                        # val = [val1, val2]
-                        # if const_idx == -1:
-                        #     const_idx = val.index(min(val))
-
-                        # if 0==const_idx:
-                        #     constraints += [m*(temp_x[t][0] - mean_p0) - (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) <= S_big_repeated[0, t]]
-                        # elif 1==const_idx:
-                        #     constraints += [-m*(temp_x[t][0] - mean_p0) + (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) <= S_big_repeated[0, t]]
-
-
-                        Sigma = np.identity(n=2)
-                        ref_pose = np.array((ref_traj[t][0], ref_traj[t][1])) 
-
-                        n_star, d_star, const_idx = makeconstraint.choose_closest_tangent(mean, Sigma, R, m, ref_pose, const_idx)
-                        # logging.info(f"m:{m}")
-                        if n_star @ mean <= d_star:
-                            constraints += [
-                                n_star.T @ cp.vstack([temp_x[t][0], temp_x[t][1]]) >= d_star + Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) \
-                                # + R*np.sqrt(m*m+1)
-                            ]
-                            value = n_star[0] * ref_pose[0] + n_star[1] * ref_pose[1] - d_star - Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)
-                            # logging.info(f"{value}>=0")
-                            # logging.info(f"-Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2):{-Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)}")
-                            # logging.info(f"cov_fro:{cov_fro_sqrt}")
-                            A = -n_star
-                            b = - ( d_star + Gamma_ijt * cov_fro_sqrt *  np.linalg.norm(M.T, 2))
-                        else:
-                            constraints += [
-                                n_star.T @ cp.vstack([temp_x[t][0], temp_x[t][1]]) <= d_star - Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) \
-                                # - R*np.sqrt(m*m+1)
-                            ]
-                            value = n_star[0] * ref_pose[0] + n_star[1] * ref_pose[1] - d_star + Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)
-                            # logging.info(f"{value}<=0")                           
-                            # logging.info(f"Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2):{Gamma_ijt * cov_fro_sqrt * np.linalg.norm(M.T, 2)}")
-                            # logging.info(f"cov_fro:{cov_fro_sqrt}")
-                            A =  n_star
-                            b = ( d_star - Gamma_ijt * cov_fro_sqrt *  np.linalg.norm(M.T, 2) )
-                        
-                        # save halfspace
-                        halfspace[ov_idx][latent_idx][t] = [A[0], A[1], b]
-
-                        # save mean and tangent
-                        mean_p0p1[ov_idx][latent_idx][t] = mean
-                        tangent[ov_idx][latent_idx][t] = m
-                        cov_p0p1[ov_idx][latent_idx][t] = cov
-                        const_idx_save[ov_idx][latent_idx][t] = const_idx
-                        # constraints += [m*(temp_x[t][0] - mean_p0) - (temp_x[t][1] - mean_p1) + R*np.sqrt(m*m+1)+ Gamma_ijt * cov_fro_sqrt * cp.norm(M.T, p=2) <= S_big_repeated[0, t]]
-
-            else:
-                constraints += []
-        # constraints = []
-        self.__halfspace = halfspace
-        
-        vertices = self.__compute_vertices(params, ovehicles)
-        A_union, b_union = self.__compute_overapproximations(
-            params, ovehicles, vertices
-        )
-
-        # save moments
-        self.save_moments(ovehicles_toSave_moments, params.O, K, T, self.__prediction_horizon, self.__ego_vehicle.id, params)
-
-        ovStateMean_tau_1 = (posemean_x_save, posemean_y_save, yawmean_save)
-        ovStateCov_tau_1 = (posecov_x_save, posecov_y_save, yawcov_save)
-        meanNtangent = (mean_p0p1, tangent, cov_p0p1, 0, const_idx_save)
-        return constraints, vertices, A_union, b_union, OVconstraint, direct, ovStateMean_tau_1, ovStateCov_tau_1, meanNtangent
 
     def compute_objective(self, X, U, goal, Tsh):
         """Set the objective."""
