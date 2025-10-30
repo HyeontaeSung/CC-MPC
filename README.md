@@ -1,3 +1,9 @@
+## GMM Affine Planning
+
+```
+pytest tests/Hz20/test_montecarlo.py::test_Town03_scenario[v8ideal-scene4_ov1_brake-ph8_step1_ncoin1_r_np5000]
+```
+
 ## Introduction
 
 Work to extend the [CDC paper](https://ieeexplore.ieee.org/document/9455144) and the deep learning model Trajectron++, to motion planning in CARLA Simulator.
